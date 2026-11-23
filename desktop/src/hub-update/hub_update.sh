@@ -56,6 +56,10 @@ apply() {
   PLAN=$S/plan
   say() { echo "$*" >> "$LOG"; }
   result() { say "RESULT $*"; }
+  # The staged files and rollback copies sit in RAM. Drop them once a result
+  # is final and nothing needs them, so a refused update doesn't leave them
+  # behind (plan and log stay for the app). rollback-failed keeps them.
+  release_staging() { rm -rf "$S/files" "$S/rb"; }
 
   rollback() {
     say "STEP rolling back"
@@ -114,15 +118,18 @@ apply() {
 
   say "STEP checking"
   if [ ! -f "$R/data/codex/hub_id" ]; then
+    release_staging
     result refused "This hub has no Melodious setup yet (/data/codex/hub_id). Install it once with the installer."
     return 1
   fi
   if [ -f "$R/etc/melodious-off" ] || [ -f "$R/data/codex/melodious-off" ]; then
+    release_staging
     result refused "Melodious is turned off on this hub. Run with --turn-on to turn it back on first."
     return 1
   fi
   while read md5 mode reboot name dest; do
     if [ "$(md5_of "$S/files/$name")" != "$md5" ]; then
+      release_staging
       result nothing-changed "The copy of $dest sent to the hub is damaged. Nothing changed."
       return 1
     fi
@@ -135,6 +142,7 @@ apply() {
   done < "$PLAN"
   free=$(usable_kb)
   if [ $((need / 1024 + 4096)) -gt "$free" ]; then
+    release_staging
     result nothing-changed "The hub doesn't have enough free memory for a safe update (${free} kB free). Nothing changed."
     return 1
   fi
@@ -145,6 +153,7 @@ apply() {
     if [ -f "$dest" ]; then
       cp -p "$dest" "$S/rb/$name" && md5_of "$dest" > "$S/rb/$name.md5"
       if [ "$(md5_of "$S/rb/$name")" != "$(cat "$S/rb/$name.md5")" ]; then
+        release_staging
         result nothing-changed "Couldn't make a safe copy of $dest. Nothing changed."
         return 1
       fi
@@ -185,6 +194,7 @@ apply() {
     if ! cp "$S/files/$name" "$dest.codex-new" || ! chmod "$mode" "$dest.codex-new" ||
        [ "$(md5_of "$dest.codex-new")" != "$md5" ]; then
       remove_new_copies
+      release_staging
       result nothing-changed "Couldn't write $dest (is the hub's storage full?). Nothing changed."
       return 1
     fi
@@ -195,7 +205,7 @@ apply() {
   while read md5 mode reboot name dest; do
     if ! mv -f "$dest.codex-new" "$dest"; then
       remove_new_copies
-      if rollback; then result rolled-back "Couldn't put $dest in place, so the hub went back to its previous software."
+      if rollback; then release_staging; result rolled-back "Couldn't put $dest in place, so the hub went back to its previous software."
       else result rollback-failed "Couldn't put $dest in place and couldn't restore everything. Staging kept at $S for the installer."
       fi
       return 1
@@ -224,6 +234,7 @@ apply() {
   fi
   if rollback; then
     start_services
+    release_staging
     result rolled-back "The new hub software didn't start, so the hub went back to its previous software."
   else
     result rollback-failed "The new hub software didn't start and the old one couldn't be restored. Staging kept at $S for the installer."

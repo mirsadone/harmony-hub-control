@@ -400,6 +400,101 @@ test("refuses to update a hub where /etc/melodious-off is set and cleans up stag
   }
 });
 
+/** A stand-in ssh whose `apply` runs the real hub_update.sh against hubRoot, or writes `result` as its log. */
+function makeApplyingHub(dir, { memFreeKb, result = null }) {
+  const hubRoot = path.join(dir, "hubroot");
+  const realStage = path.join(dir, "volatile", "codex-update-1700000000");
+  const fakeStage = "/var/volatile/codex-update-1700000000";
+  fs.mkdirSync(path.join(hubRoot, "data/codex"), { recursive: true });
+  fs.mkdirSync(path.join(hubRoot, "proc"), { recursive: true });
+  fs.writeFileSync(path.join(hubRoot, "data/codex/hub_id"), "1234\n");
+  fs.writeFileSync(path.join(hubRoot, "proc/meminfo"), `MemFree: ${memFreeKb} kB\n`);
+  const apply = result
+    ? `echo "RESULT ${result}" > "${realStage}/log"`
+    : `sed "s#${fakeStage}#${realStage}#" "${realStage}/plan" > "${realStage}/plan.real" && mv "${realStage}/plan.real" "${realStage}/plan"; HUB_UPDATE_ROOT="${hubRoot}" /bin/sh "${realStage}/hub_update.sh" apply "${realStage}" || true`; // the app runs it in the background and reads only its log
+  const sshPath = path.join(dir, "fake-ssh.sh");
+  fs.writeFileSync(sshPath, [
+    "#!/bin/sh",
+    "shift $(( $# - 1 ))",
+    "cmd=$1",
+    "case \"$cmd\" in",
+    `  S=/var/volatile/codex-update-*) mkdir -p "${realStage}/files" && echo "${fakeStage}" ;;`,
+    `  "sh ${fakeStage}/hub_update.sh status "*) HUB_UPDATE_ROOT="${hubRoot}" /bin/sh "${realStage}/hub_update.sh" status \${cmd#* status } ;;`,
+    `  "cat > ${fakeStage}/"*) cat > "${realStage}/\${cmd#cat > ${fakeStage}/}" ;;`,
+    `  *"hub_update.sh apply ${fakeStage}"*) ${apply} ;;`,
+    `  "cat ${fakeStage}/log "*) cat "${realStage}/log" ;;`,
+    `  "rm -rf ${fakeStage}") rm -rf "${realStage}" ;;`,
+    "  *) exit 99 ;;",
+    "esac",
+  ].join("\n"), { mode: 0o755 });
+  const keyPath = path.join(dir, "key");
+  fs.writeFileSync(keyPath, "fake-key\n");
+  return { realStage, sshPath, keyPath };
+}
+
+function oneFilePayload() {
+  // A destination that is on no test machine, so the memory check needs no file.
+  const body = Buffer.from("new codex_webui\n");
+  return {
+    version: "9.5.0",
+    files: [{ rel: "payload/bin/codex_webui", dest: "/melodious-test-absent/codex_webui", mode: "755", reboot: 0, body, md5: md5(body), name: "payload_bin_codex_webui" }],
+  };
+}
+
+test("a refused or rolled-back update leaves no staging in the hub's RAM; a failed rollback keeps it", { skip: win }, async () => {
+  const run = async (dir, hubOpts) => {
+    const hub = makeApplyingHub(dir, hubOpts);
+    const outcome = await updateHub({
+      payload: oneFilePayload(),
+      host: "127.0.0.1",
+      keyPath: hub.keyPath,
+      sshPath: hub.sshPath,
+      fetchImpl: () => assert.fail("a chosen zip downloads nothing"),
+      pollMs: 10,
+      versionProbe: async () => ({ version: "9.5.0" }),
+    }).then(() => null, (err) => err);
+    return { hub, err: outcome };
+  };
+  for (const [label, hubOpts, message, kept] of [
+    ["not enough memory (real hub_update.sh)", { memFreeKb: 1000 }, /enough free memory/, false],
+    ["rolled back", { memFreeKb: 16384, result: "rolled-back The new hub software didn't start, so the hub went back to its previous software." }, /went back to its previous software/, false],
+    ["rollback failed", { memFreeKb: 16384, result: "rollback-failed Couldn't restore everything. Staging kept for the installer." }, /Staging kept/, true],
+  ]) {
+    const dir = tmp();
+    try {
+      const { hub, err } = await run(dir, hubOpts);
+      assert.ok(err, `${label}: rejects`);
+      assert.match(err.message, message, label);
+      assert.equal(fs.existsSync(hub.realStage), kept, `${label}: staging ${kept ? "kept" : "removed"}`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("hub_update.sh frees its staged files itself when it refuses, keeping plan and log", { skip: win }, () => {
+  const dir = tmp();
+  try {
+    const hubRoot = path.join(dir, "hubroot");
+    fs.mkdirSync(path.join(hubRoot, "data/codex"), { recursive: true });
+    fs.mkdirSync(path.join(hubRoot, "proc"), { recursive: true });
+    fs.writeFileSync(path.join(hubRoot, "data/codex/hub_id"), "1234\n");
+    fs.writeFileSync(path.join(hubRoot, "proc/meminfo"), "MemFree: 1000 kB\n");
+    const stage = path.join(dir, "stage");
+    const f = oneFilePayload().files[0];
+    fs.mkdirSync(path.join(stage, "files"), { recursive: true });
+    fs.writeFileSync(path.join(stage, "files", f.name), f.body);
+    fs.writeFileSync(path.join(stage, "plan"), `${f.md5} ${f.mode} ${f.reboot} ${f.name} ${f.dest}\n`);
+    const script = path.join(ROOT, "desktop/src/hub-update/hub_update.sh");
+    assert.throws(() => execFileSync("/bin/sh", [script, "apply", stage], { env: { ...process.env, HUB_UPDATE_ROOT: hubRoot } }));
+    assert.match(fs.readFileSync(path.join(stage, "log"), "utf8"), /^RESULT nothing-changed The hub doesn't have enough free memory/m);
+    assert.equal(fs.existsSync(path.join(stage, "files")), false, "staged files removed");
+    assert.equal(fs.existsSync(path.join(stage, "plan")), true, "plan kept");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // End to end against tools/hub-emu with Dropbear on 127.0.0.1:2222 and a test
 // key (see the Auto-Update notes). Off by default.
 test("updates hub-emu over SSH, then finds nothing left to do", { skip: !process.env.HUB_EMU_SSH }, async () => {

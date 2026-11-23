@@ -260,6 +260,10 @@ async function updateHub({
   const target = payload ? payload.version : release.version;
   const work = fs.mkdtempSync(path.join(os.tmpdir(), "melodious-hubzip-"));
   const ssh = createSsh({ host, keyPath, port: sshPort, sshPath, knownHosts });
+  // The hub's staging folder is in its RAM: remove it however the update
+  // ends, except when the hub may still need it (see keepStage below).
+  let stage = null;
+  let keepStage = false;
   try {
     let files;
     if (payload) {
@@ -271,21 +275,20 @@ async function updateHub({
     }
 
     onStep("Connecting to the hub…");
-    let stage;
+    let made;
     try {
-      stage = (await ssh("S=/var/volatile/codex-update-$(date +%s); mkdir -p /var/volatile && mkdir \"$S\" && chmod 700 \"$S\" && mkdir \"$S/files\" && echo \"$S\"")).trim();
+      made = (await ssh("S=/var/volatile/codex-update-$(date +%s); mkdir -p /var/volatile && mkdir \"$S\" && chmod 700 \"$S\" && mkdir \"$S/files\" && echo \"$S\"")).trim();
     } catch (err) {
       throw new HubUpdateError(friendlySshError(err));
     }
-    if (!/^\/var\/volatile\/codex-update-\d+$/.test(stage)) throw new HubUpdateError(`Unexpected staging folder: ${stage}`);
+    if (!/^\/var\/volatile\/codex-update-\d+$/.test(made)) throw new HubUpdateError(`Unexpected staging folder: ${made}`);
+    stage = made;
     await ssh(`cat > ${stage}/hub_update.sh`, { input: fs.readFileSync(SCRIPT_PATH) });
     const status = await ssh(`sh ${stage}/hub_update.sh status ${files.map((f) => f.dest).join(" ")}`);
     if (!/^hub_id yes$/m.test(status)) {
-      await ssh(`rm -rf ${stage}`).catch(() => {});
       throw new HubUpdateError("This hub has no Melodious setup yet. Install it once with the installer.");
     }
     if (/^melodious off$/m.test(status)) {
-      await ssh(`rm -rf ${stage}`).catch(() => {});
       throw new HubUpdateError("Melodious is turned off on this hub. Run with --turn-on to turn it back on first.");
     }
     const current = new Map();
@@ -293,11 +296,9 @@ async function updateHub({
     const differing = changedFiles(files, current);
     const changed = force ? [...files] : differing;
     if (!changed.length) {
-      await ssh(`rm -rf ${stage}`).catch(() => {});
       return { ok: true, alreadyCurrent: true, total: files.length, message: `The hub already has Melodious ${target}'s software.` };
     }
     if (confirmChange && !(await confirmChange({ differing, total: files.length }))) {
-      await ssh(`rm -rf ${stage}`).catch(() => {});
       return { ok: false, cancelled: true, total: files.length, message: "Nothing was changed on the hub." };
     }
     // codex_webui goes last, as with the installer.
@@ -329,15 +330,22 @@ async function updateHub({
       const m = /^RESULT (\S+) ?(.*)$/m.exec(log);
       if (m) result = { code: m[1], text: m[2] };
     }
-    if (!result) throw new HubUpdateError("The hub didn't finish the update in 6 minutes. Check it with the installer.");
+    if (!result) {
+      keepStage = true; // the hub may still be working from it
+      throw new HubUpdateError("The hub didn't finish the update in 6 minutes. Check it with the installer.");
+    }
+    // hub_update.sh keeps the staging for the installer when it couldn't roll back.
+    if (result.code === "rollback-failed") keepStage = true;
     if (result.code !== "ok") throw new HubUpdateError(result.text || `The hub update ended with ${result.code}.`);
 
     const rebooted = result.text === "reboot";
     if (rebooted) {
+      keepStage = true; // the reboot clears the hub's RAM
       onStep("The hub is restarting…");
       await sleep(rebootWaitMs);
     } else {
       await ssh(`rm -rf ${stage}`).catch(() => {});
+      stage = null;
     }
     onStep("Waiting for the hub…");
     const until = Date.now() + (rebooted ? 4 * 60 * 1000 : 60 * 1000);
@@ -360,6 +368,7 @@ async function updateHub({
       message: `The hub was updated${rebooted ? " and restarted" : ""}. It reports Melodious ${runs}.`,
     };
   } finally {
+    if (stage && !keepStage) await ssh(`rm -rf ${stage}`).catch(() => {});
     fs.rmSync(work, { recursive: true, force: true });
   }
 }
